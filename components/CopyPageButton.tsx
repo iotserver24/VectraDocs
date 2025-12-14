@@ -61,11 +61,10 @@ export function CopyPageButton({ pageTitle, pageUrl }: CopyPageButtonProps) {
         setIsOpen(false);
     };
 
-    const handleOpenInClaude = async () => {
-        const prompt = getPromptWithUrl();
-        // Claude doesn't have a direct query parameter, so we copy and open
-        await navigator.clipboard.writeText(prompt);
-        window.open('https://claude.ai/new', '_blank');
+    const handleOpenInClaude = () => {
+        const url = getFullUrl();
+        const query = encodeURIComponent(`Read from ${url} so I can ask questions about it.`);
+        window.open(`https://claude.ai/new?q=${query}`, '_blank');
         setIsOpen(false);
     };
 
