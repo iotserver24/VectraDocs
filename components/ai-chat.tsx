@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Sparkles, X, Bot, ArrowUp, Trash2, Maximize2, Copy, Check, ThumbsUp, ThumbsDown } from "lucide-react";
+import { Sparkles, X, Bot, ArrowUp, Trash2, Maximize2, Copy, Check, ThumbsUp, ThumbsDown, Loader2, Search } from "lucide-react";
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -30,7 +30,7 @@ const CopyButton = ({ text, className = "", label = "" }: { text: string, classN
 
 export function AIChat() {
     const [isOpen, setIsOpen] = useState(false);
-    const [messages, setMessages] = useState<{ role: string; content: string }[]>([]);
+    const [messages, setMessages] = useState<{ role: string; content: string; searchQuery?: string; sources?: { title: string; url: string }[] }[]>([]);
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
     const [isFocused, setIsFocused] = useState(false);
@@ -99,9 +99,24 @@ export function AIChat() {
 
             if (!response.body) throw new Error("No response body");
 
+            // Capture search query and sources from headers
+            const searchQuery = response.headers.get("X-Search-Term")
+                ? decodeURIComponent(response.headers.get("X-Search-Term")!)
+                : undefined;
+
+            let sources: { title: string; url: string }[] = [];
+            const sourcesHeader = response.headers.get("X-Sources");
+            if (sourcesHeader) {
+                try {
+                    sources = JSON.parse(sourcesHeader);
+                } catch (e) {
+                    console.error("Failed to parse sources header", e);
+                }
+            }
+
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
-            let aiMsg = { role: "assistant", content: "" };
+            let aiMsg = { role: "assistant", content: "", searchQuery, sources };
 
             setMessages((prev) => [...prev, aiMsg]);
 
@@ -250,11 +265,41 @@ export function AIChat() {
                     {messages.map((m, i) => (
                         <div key={i} className={`flex flex-col gap-1 ${m.role === "user" ? "items-end" : "items-start"}`}>
                             {m.role === "assistant" && (
-                                <div className="flex items-center gap-2 mb-1">
-                                    <div className="w-5 h-5 rounded bg-orange-500/10 flex items-center justify-center text-orange-500">
-                                        <Sparkles className="w-3 h-3" />
+                                <div className="flex flex-col gap-1 mb-1">
+                                    <div className="flex items-center gap-2">
+                                        <div className="w-5 h-5 rounded bg-orange-500/10 flex items-center justify-center text-orange-500">
+                                            <Sparkles className="w-3 h-3" />
+                                        </div>
+                                        <span className="text-xs font-medium text-orange-500">Assistant</span>
                                     </div>
-                                    <span className="text-xs font-medium text-orange-500">Assistant</span>
+
+                                    {/* Search Status / Sources Indicator */}
+                                    {(m.searchQuery || (m.sources && m.sources.length > 0)) && (
+                                        <div className="flex flex-col gap-1 ml-1 mt-1 mb-2 text-xs text-zinc-500">
+                                            {/* Query */}
+                                            {m.searchQuery && (
+                                                <div className="flex items-center gap-2">
+                                                    <Search className="w-3 h-3" />
+                                                    <span>Searching for <span className="text-zinc-400">"{m.searchQuery}"</span></span>
+                                                </div>
+                                            )}
+
+                                            {/* Sources List - Vertical with arrows */}
+                                            {m.sources && m.sources.length > 0 && m.sources.map((source, idx) => (
+                                                <div key={idx} className="flex items-center gap-1.5">
+                                                    <span className="text-zinc-600">Referring →</span>
+                                                    <a
+                                                        href={source.url}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="text-zinc-400 hover:text-orange-400 transition-colors underline underline-offset-2"
+                                                    >
+                                                        {source.title}
+                                                    </a>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
                             )}
 

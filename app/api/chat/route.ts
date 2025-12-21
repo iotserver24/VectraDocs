@@ -1,8 +1,3 @@
-import { ChatOpenAI } from "@langchain/openai";
-import { HumanMessage, AIMessage } from "@langchain/core/messages";
-import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
-import { StringOutputParser } from "@langchain/core/output_parsers";
-import { RunnableSequence } from "@langchain/core/runnables";
 import { restore } from '@orama/plugin-data-persistence';
 import { search } from '@orama/orama';
 import fs from 'fs';
@@ -24,92 +19,99 @@ async function getOramaDB() {
     }
 }
 
+// Pre-warm DB on module load
+getOramaDB();
+
 export async function POST(req: Request) {
     const { messages } = await req.json();
     const lastMessage = messages[messages.length - 1].content;
 
-    // 1. Setup Memory (Reconstruct history from request)
-    // Manually map messages to LangChain types
-    const history = messages.slice(0, -1).map((m: any) =>
-        m.role === 'user' ? new HumanMessage(m.content) : new AIMessage(m.content)
-    );
-
-    // 2. RAG Retrieval
+    // RAG Retrieval (parallel with nothing - just fast)
     const db = await getOramaDB();
     let context = "";
-    let sources: string[] = [];
+    let sourcesPayload: { title: string; url: string }[] = [];
+
     if (db) {
         const searchResult = await search(db, { term: lastMessage, limit: 3 });
         context = searchResult.hits
-            .map((h) => `Source: ${h.document.title} (${h.document.url})\nContent: ${h.document.content}`)
-            .join("\n---\n");
-        sources = searchResult.hits.map((h) => `- [${h.document.title}](${h.document.url})`);
+            .map((h) => `[${h.document.title}]: ${h.document.content}`)
+            .join("\n\n");
+        sourcesPayload = searchResult.hits.map((h) => ({
+            title: h.document.title as string,
+            url: h.document.url as string
+        }));
     }
 
-    // 3. Prompt Template
-    const prompt = ChatPromptTemplate.fromMessages([
-        ["system", `You are a helpful documentation assistant for "VectraDocs".
-    Answer questions based ONLY on the provided documentation context.
-    
-    Context:
-    {context}
-    
-    IMPORTANT RULES:
-    1. Only answer based on the provided context
-    2. If the answer is not in the context, apologize and say you don't have information about that
-    3. Be concise but helpful
-    4. Include code examples when relevant
-    5. At the END of your response, ALWAYS include a "📚 References" section with links to relevant documentation pages
-    6. Use the EXACT URLs from the context (they are relative paths like /docs/installation)
-    7. Format references as markdown links: [Page Title](/docs/page-path)
-    
-    Example reference section:
-    
-    📚 **References:**
-    - [Installation Guide](/docs/installation)
-    - [Backend Setup](/docs/backend-setup)`],
-        new MessagesPlaceholder("history"),
-        ["human", "{input}"],
-    ]);
+    // Build messages for API (shorter system prompt)
+    const systemPrompt = `You are a docs assistant. Answer using ONLY the context below. Be concise.
 
-    // 4. LLM Setup (Generic OpenAI Compatible)
-    const model = new ChatOpenAI({
-        modelName: process.env.LLM_MODEL || "gpt-3.5-turbo",
-        configuration: {
-            baseURL: process.env.LLM_BASE_URL,
-            apiKey: process.env.LLM_API_KEY,
+Context:
+${context}
+
+Rules: If info not in context, say so. Add 📚 References section with markdown links at end.`;
+
+    const apiMessages = [
+        { role: "system", content: systemPrompt },
+        ...messages.slice(-6).map((m: any) => ({ role: m.role, content: m.content }))
+    ];
+
+    // Direct OpenAI-compatible API call (faster than LangChain)
+    const response = await fetch(`${process.env.LLM_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.LLM_API_KEY}`
         },
-        streaming: true,
-        temperature: 0,
+        body: JSON.stringify({
+            model: process.env.LLM_MODEL || "gpt-3.5-turbo",
+            messages: apiMessages,
+            stream: true,
+            temperature: 0
+        })
     });
 
-    // 5. Chain & Stream
-    const chain = RunnableSequence.from([
-        {
-            input: (initialInput) => initialInput.input,
-            context: (initialInput) => initialInput.context, // Pass context explicitly
-            history: () => history,
-        },
-        prompt,
-        model,
-        new StringOutputParser(),
-    ]);
+    if (!response.body) {
+        return new Response("No response", { status: 500 });
+    }
 
-    const stream = await chain.stream({
-        input: lastMessage,
-        context: context // Inject computed context here
-    });
-
-    // Convert LangChain stream to Web Response Stream
-    const encoder = new TextEncoder();
+    // Stream SSE response directly
     const transformStream = new ReadableStream({
         async start(controller) {
-            for await (const chunk of stream) {
-                controller.enqueue(encoder.encode(chunk));
+            const reader = response.body!.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || "";
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = line.slice(6);
+                        if (data === '[DONE]') continue;
+                        try {
+                            const json = JSON.parse(data);
+                            const content = json.choices?.[0]?.delta?.content;
+                            if (content) {
+                                controller.enqueue(new TextEncoder().encode(content));
+                            }
+                        } catch { }
+                    }
+                }
             }
             controller.close();
-        },
+        }
     });
 
-    return new Response(transformStream);
+    return new Response(transformStream, {
+        headers: {
+            'X-Search-Term': encodeURIComponent(lastMessage),
+            'X-Sources-Count': sourcesPayload.length.toString(),
+            'X-Sources': JSON.stringify(sourcesPayload)
+        }
+    });
 }
